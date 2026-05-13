@@ -2,22 +2,17 @@ import argparse
 import json
 import os
 import secrets
-import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
-# 临时打印调试信息
-print("=== 环境变量调试 ===")
-print("ADMIN_USERNAME:", repr(os.getenv("ADMIN_USERNAME")))
-print("ADMIN_PASSWORD:", repr(os.getenv("ADMIN_PASSWORD")))
-print("所有环境变量中是否存在该键:", "ADMIN_PASSWORD" in os.environ)
-print("====================")
+from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine, desc, func, insert, select, text
+from sqlalchemy.engine import Engine
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -87,39 +82,42 @@ class AdminConfig:
 
 
 class Store:
-    def __init__(self, db_path: Path) -> None:
-        self.db_path = db_path
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init()
+    def __init__(self, database_url: str) -> None:
+        self.database_url = database_url
+        self.engine = self._create_engine(database_url)
+        self.metadata = MetaData()
+        self.survey = Table(
+            "survey",
+            self.metadata,
+            Column("id", Integer, primary_key=True, autoincrement=True),
+            Column("created_at", String, nullable=False),
+            Column("name", String),
+            Column("age_range", String),
+            Column("gender", String),
+            Column("city", String),
+            Column("occupation", String),
+            Column("contact", String),
+            Column("purpose", String),
+            Column("feedback", String),
+            Column("consent", Integer, nullable=False),
+            Column("user_agent", String),
+            Column("ip", String),
+        )
+        self.metadata.create_all(self.engine)
+        self._ensure_indexes()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path))
-        conn.row_factory = sqlite3.Row
-        return conn
+    def _create_engine(self, database_url: str) -> Engine:
+        connect_args: Dict[str, object] = {}
+        if database_url.startswith("sqlite:"):
+            connect_args["check_same_thread"] = False
+        return create_engine(database_url, pool_pre_ping=True, future=True, connect_args=connect_args)
 
-    def _init(self) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                create table if not exists survey (
-                    id integer primary key autoincrement,
-                    created_at text not null,
-                    name text,
-                    age_range text,
-                    gender text,
-                    city text,
-                    occupation text,
-                    contact text,
-                    purpose text,
-                    feedback text,
-                    consent integer not null,
-                    user_agent text,
-                    ip text
-                )
-                """
-            )
-            conn.execute("create index if not exists idx_survey_created_at on survey(created_at)")
-            conn.commit()
+    def _ensure_indexes(self) -> None:
+        with self.engine.begin() as conn:
+            if self.database_url.startswith("sqlite:"):
+                conn.execute(text("create index if not exists idx_survey_created_at on survey(created_at)"))
+            else:
+                conn.execute(text("create index if not exists idx_survey_created_at on survey(created_at)"))
 
     def insert_survey(self, payload: Dict[str, object], *, user_agent: str, ip: str) -> int:
         name = _clamp_len(str(payload.get("name") or "").strip(), 80)
@@ -133,62 +131,87 @@ class Store:
         consent = 1 if bool(payload.get("consent")) else 0
         created_at = _utc_now_iso()
 
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                insert into survey (
-                    created_at, name, age_range, gender, city, occupation, contact, purpose, feedback, consent, user_agent, ip
-                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    created_at,
-                    name,
-                    age_range,
-                    gender,
-                    city,
-                    occupation,
-                    contact,
-                    purpose,
-                    feedback,
-                    consent,
-                    _clamp_len(user_agent, 320),
-                    _clamp_len(ip, 80),
-                ),
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                insert(self.survey).values(
+                    created_at=created_at,
+                    name=name,
+                    age_range=age_range,
+                    gender=gender,
+                    city=city,
+                    occupation=occupation,
+                    contact=contact,
+                    purpose=purpose,
+                    feedback=feedback,
+                    consent=consent,
+                    user_agent=_clamp_len(user_agent, 320),
+                    ip=_clamp_len(ip, 80),
+                )
             )
-            conn.commit()
-            return int(cur.lastrowid)
+            try:
+                return int(result.inserted_primary_key[0])
+            except Exception:
+                row_id = result.scalar_one_or_none()
+                return int(row_id or 0)
 
-    def list_surveys(self, *, limit: int = 200) -> List[sqlite3.Row]:
+    def list_surveys(self, *, limit: int = 200) -> List[Mapping[str, object]]:
         limit = max(1, min(limit, 2000))
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                select
-                    id, created_at, name, age_range, gender, city, occupation, contact, purpose, feedback, consent, user_agent, ip
-                from survey
-                order by id desc
-                limit ?
-                """,
-                (limit,),
+        with self.engine.begin() as conn:
+            rows = (
+                conn.execute(
+                    select(
+                        self.survey.c.id,
+                        self.survey.c.created_at,
+                        self.survey.c.name,
+                        self.survey.c.age_range,
+                        self.survey.c.gender,
+                        self.survey.c.city,
+                        self.survey.c.occupation,
+                        self.survey.c.contact,
+                        self.survey.c.purpose,
+                        self.survey.c.feedback,
+                        self.survey.c.consent,
+                        self.survey.c.user_agent,
+                        self.survey.c.ip,
+                    )
+                    .order_by(desc(self.survey.c.id))
+                    .limit(limit)
+                )
+                .mappings()
+                .all()
             )
-            return list(cur.fetchall())
+            return list(rows)
 
     def stats(self) -> Dict[str, object]:
-        with self._connect() as conn:
-            total = int(conn.execute("select count(1) as c from survey").fetchone()["c"])
+        with self.engine.begin() as conn:
+            total = int(conn.execute(select(func.count()).select_from(self.survey)).scalar_one())
             today_prefix = datetime.now(timezone.utc).date().isoformat()
             today = int(
-                conn.execute("select count(1) as c from survey where created_at like ?", (f"{today_prefix}%",)).fetchone()["c"]
+                conn.execute(
+                    select(func.count())
+                    .select_from(self.survey)
+                    .where(self.survey.c.created_at.like(f"{today_prefix}%"))
+                ).scalar_one()
             )
             age = conn.execute(
-                "select age_range as k, count(1) as c from survey group by age_range order by c desc"
-            ).fetchall()
+                select(self.survey.c.age_range.label("k"), func.count().label("c"))
+                .select_from(self.survey)
+                .group_by(self.survey.c.age_range)
+                .order_by(desc("c"))
+            ).mappings().all()
             gender = conn.execute(
-                "select gender as k, count(1) as c from survey group by gender order by c desc"
-            ).fetchall()
+                select(self.survey.c.gender.label("k"), func.count().label("c"))
+                .select_from(self.survey)
+                .group_by(self.survey.c.gender)
+                .order_by(desc("c"))
+            ).mappings().all()
             city = conn.execute(
-                "select city as k, count(1) as c from survey group by city order by c desc limit 8"
-            ).fetchall()
+                select(self.survey.c.city.label("k"), func.count().label("c"))
+                .select_from(self.survey)
+                .group_by(self.survey.c.city)
+                .order_by(desc("c"))
+                .limit(8)
+            ).mappings().all()
         return {
             "total": total,
             "today": today,
@@ -255,7 +278,7 @@ def _read_body(handler: BaseHTTPRequestHandler, *, limit: int = 64_000) -> bytes
     return handler.rfile.read(length)
 
 
-def _iter_rows_csv(rows: Iterable[sqlite3.Row]) -> Iterable[str]:
+def _iter_rows_csv(rows: Iterable[Mapping[str, object]]) -> Iterable[str]:
     header = [
         "id",
         "created_at",
@@ -273,7 +296,7 @@ def _iter_rows_csv(rows: Iterable[sqlite3.Row]) -> Iterable[str]:
     ]
     yield ",".join(header) + "\n"
     for r in rows:
-        values = [str((r[k] if k in r.keys() else "") or "") for k in header]
+        values = [str(r.get(k, "") or "") for k in header]
         escaped = []
         for v in values:
             v = v.replace('"', '""')
@@ -651,7 +674,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     root_dir = Path(__file__).resolve().parents[1]
-    store = Store(root_dir / "backend" / "data" / "survey.sqlite3")
+    default_sqlite = (root_dir / "backend" / "data" / "survey.sqlite3").resolve()
+    default_url = f"sqlite:///{default_sqlite.as_posix()}"
+    database_url = _read_env("DATABASE_URL") or default_url
+    if database_url.startswith("postgres://"):
+        database_url = "postgresql://" + database_url[len("postgres://") :]
+    store = Store(database_url)
     sessions = Sessions()
 
     admin_user = _read_env("ADMIN_USERNAME") or "admin"
