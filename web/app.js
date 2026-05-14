@@ -22,6 +22,8 @@ const layer = $("layer");
 const btnStart = $("btnStart");
 const btnClear = $("btnClear");
 const chipStatus = $("chipStatus");
+const settingsPanel = $("settingsPanel");
+const togglePanel = $("togglePanel");
 
 const surveyModal = $("surveyModal");
 const surveyForm = $("surveyForm");
@@ -51,6 +53,17 @@ const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const storageKey = "lovePopSurveySubmittedV1";
 let surveyReady = false;
 const apiBase = String(window.__LOVEPOP_API_BASE__ || "").replace(/\/+$/, "");
+let panelCollapsed = false;
+
+const setPanelCollapsed = (collapsed) => {
+  if (!settingsPanel) return;
+  panelCollapsed = collapsed;
+  settingsPanel.classList.toggle("collapsed", collapsed);
+};
+
+if (togglePanel && settingsPanel) {
+  togglePanel.addEventListener("click", () => setPanelCollapsed(!panelCollapsed));
+}
 
 const setButtonsEnabled = (enabled) => {
   btnStart.disabled = !enabled;
@@ -250,6 +263,7 @@ class Engine {
     this.running = true;
     this.phase = "heart";
     this.spawned = 0;
+    setPanelCollapsed(true);
 
     const config = this.readConfig();
     this.currentConfig = config;
@@ -271,6 +285,7 @@ class Engine {
     btnStart.textContent = "开始";
     chipStatus.textContent = clear ? "已清空" : "已暂停";
     if (clear) this.clear();
+    setPanelCollapsed(false);
   }
 
   toggle() {
